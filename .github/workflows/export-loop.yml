@@ -54,21 +54,34 @@ jobs:
           DEPLOYED_FILE: ${{ runner.temp }}/pages-deployed
         run: |
           end=$((SECONDS + 320 * 60))
+          # 連續拿不到匯出程式就提早結束，讓下一輪換一台新機器重開（2026-11-04 拿不到匯出程式，停擺 5 小時）
+          clone_fail=0
+          last_q=""
           while [ "$SECONDS" -lt "$end" ]; do
             echo "== $(TZ=Asia/Taipei date '+%H:%M') =="
             # 每一輪重新拿最新的匯出程式（只拿 scripts 和設定），推了新程式不用重開接力
             rm -rf market
             if git clone -q --depth=1 --filter=blob:none --sparse "$PUSH_URL" market \
               && git -C market sparse-checkout set scripts src/lib; then
+              clone_fail=0
               (cd market && bash scripts/export-once.sh) || echo "這一輪失敗，5 分鐘後再試"
               # 推完 site 就直接上傳到 Cloudflare Pages（舊版程式沒有這支就跳過）
               if [ -f market/scripts/pages-deploy.sh ]; then
                 (cd market && bash scripts/pages-deploy.sh) || echo "這一輪上傳失敗，5 分鐘後再試"
               fi
             else
-              echo "拿不到匯出程式（部署金鑰沒設好？），5 分鐘後再試"
+              clone_fail=$((clone_fail + 1))
+              echo "拿不到匯出程式（部署金鑰沒設好？），連續第 $clone_fail 次"
+              if [ "$clone_fail" -ge 2 ]; then echo "連續 2 次拿不到，提早結束這一輪，換下一輪重開"; break; fi
             fi
-            sleep 300
+            # 排隊上線（2026-11-08）：等 5 分鐘的時候每 20 秒看一下排隊分支 q/*，出現新的才提早開始；
+            # 同一批清不掉、或這輪拿不到程式，就照常等滿 5 分鐘（免得一直連跑或一直重開）
+            waited=0
+            while [ "$waited" -lt 300 ]; do
+              sleep 20; waited=$((waited + 20))
+              now_q="$(git ls-remote "$PUSH_URL" 'refs/heads/q/*' 2>/dev/null)"
+              if [ "$clone_fail" -eq 0 ] && [ -n "$now_q" ] && [ "$now_q" != "$last_q" ]; then last_q="$now_q"; echo "有新的排隊分支，提早開始"; break; fi
+            done
           done
 
       - name: 接力：開下一輪
